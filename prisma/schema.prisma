@@ -1,0 +1,336 @@
+// Wallpaper CMS database schema (PostgreSQL, Prisma ORM 7).
+// Conventions: UUIDv7 primary keys (time-ordered, index friendly), snake_case table/column
+// names, timestamptz for all timestamps.
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "cjs"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum AdminRole {
+  SUPER_ADMIN
+  EDITOR
+}
+
+enum MediaVariantType {
+  ORIGINAL
+  PREVIEW
+  THUMBNAIL
+}
+
+enum WallpaperOrientation {
+  PORTRAIT
+  LANDSCAPE
+  SQUARE
+}
+
+enum BannerActionType {
+  NONE
+  OPEN_WALLPAPER
+  OPEN_CATEGORY
+  OPEN_URL
+}
+
+enum HomeSectionType {
+  BANNERS
+  FEATURED_WALLPAPERS
+  POPULAR_WALLPAPERS
+  LATEST_WALLPAPERS
+  CATEGORY_WALLPAPERS
+  CUSTOM_WALLPAPERS
+  CATEGORIES
+}
+
+/// WALLPAPER_DOWNLOAD_CLICK = user tapped "download"; WALLPAPER_DOWNLOAD = app confirmed the file was saved.
+enum WallpaperEventType {
+  WALLPAPER_VIEW
+  WALLPAPER_DOWNLOAD_CLICK
+  WALLPAPER_DOWNLOAD
+}
+
+enum ClientPlatform {
+  ANDROID
+  IOS
+  OTHER
+}
+
+// ---------------------------------------------------------------------------
+// Administration & authentication
+// ---------------------------------------------------------------------------
+
+model Admin {
+  id                  String    @id @default(uuid(7)) @db.Uuid
+  name                String    @db.VarChar(120)
+  /// Always stored lower-cased.
+  email               String    @unique @db.VarChar(254)
+  passwordHash        String    @map("password_hash")
+  role                AdminRole @default(EDITOR)
+  isActive            Boolean   @default(true) @map("is_active")
+  failedLoginAttempts Int       @default(0) @map("failed_login_attempts")
+  lockedUntil         DateTime? @map("locked_until") @db.Timestamptz(3)
+  lastLoginAt         DateTime? @map("last_login_at") @db.Timestamptz(3)
+  /// Embedded in access tokens; bumping it invalidates all outstanding access tokens.
+  tokenVersion        Int       @default(0) @map("token_version")
+  createdAt           DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt           DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  refreshTokens   RefreshToken[]
+  auditLogs       AuditLog[]
+  uploadedMedia   MediaAsset[]
+  settingsUpdates AppSetting[]
+
+  @@map("admins")
+}
+
+/// Rotating refresh tokens. Only a SHA-256 hash of the secret part is stored.
+/// All tokens issued from one login share a familyId so reuse of a rotated token
+/// can revoke the whole family.
+model RefreshToken {
+  id            String    @id @default(uuid(7)) @db.Uuid
+  adminId       String    @map("admin_id") @db.Uuid
+  familyId      String    @map("family_id") @db.Uuid
+  tokenHash     String    @map("token_hash") @db.VarChar(64)
+  expiresAt     DateTime  @map("expires_at") @db.Timestamptz(3)
+  revokedAt     DateTime? @map("revoked_at") @db.Timestamptz(3)
+  revokedReason String?   @map("revoked_reason") @db.VarChar(32)
+  replacedById  String?   @map("replaced_by_id") @db.Uuid
+  userAgent     String?   @map("user_agent") @db.VarChar(255)
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  admin Admin @relation(fields: [adminId], references: [id], onDelete: Cascade)
+
+  @@index([adminId])
+  @@index([familyId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+model AuditLog {
+  id         String   @id @default(uuid(7)) @db.Uuid
+  adminId    String?  @map("admin_id") @db.Uuid
+  action     String   @db.VarChar(64)
+  entityType String   @map("entity_type") @db.VarChar(64)
+  entityId   String?  @map("entity_id") @db.VarChar(64)
+  /// Sanitized: secrets/passwords/tokens are stripped before persisting.
+  metadata   Json?
+  ipAddress  String?  @map("ip_address") @db.VarChar(64)
+  userAgent  String?  @map("user_agent") @db.VarChar(255)
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  admin Admin? @relation(fields: [adminId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt(sort: Desc)])
+  @@index([adminId, createdAt(sort: Desc)])
+  @@index([entityType, entityId])
+  @@index([action])
+  @@map("audit_logs")
+}
+
+// ---------------------------------------------------------------------------
+// Media
+// ---------------------------------------------------------------------------
+
+/// One row per stored object. An ORIGINAL row is the logical "media item" that other
+/// entities reference; PREVIEW and THUMBNAIL rows are derivatives linked via parentId.
+/// Public URLs are not stored: they are derived from storageKey + MEDIA_PUBLIC_BASE_URL,
+/// so the CDN/bucket can change without a data migration.
+model MediaAsset {
+  id               String           @id @default(uuid(7)) @db.Uuid
+  parentId         String?          @map("parent_id") @db.Uuid
+  variantType      MediaVariantType @map("variant_type")
+  storageKey       String           @unique @map("storage_key") @db.VarChar(512)
+  mimeType         String           @map("mime_type") @db.VarChar(64)
+  size             Int
+  width            Int
+  height           Int
+  checksumSha256   String           @map("checksum_sha256") @db.VarChar(64)
+  originalFilename String?          @map("original_filename") @db.VarChar(255)
+  uploadedById     String?          @map("uploaded_by_id") @db.Uuid
+  createdAt        DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  parent     MediaAsset?  @relation("MediaVariants", fields: [parentId], references: [id], onDelete: Cascade)
+  variants   MediaAsset[] @relation("MediaVariants")
+  uploadedBy Admin?       @relation(fields: [uploadedById], references: [id], onDelete: SetNull)
+
+  wallpapers     Wallpaper[]
+  categoryCovers Category[]
+  banners        Banner[]
+
+  @@unique([parentId, variantType])
+  @@index([variantType, createdAt(sort: Desc)])
+  @@index([checksumSha256])
+  @@map("media_assets")
+}
+
+// ---------------------------------------------------------------------------
+// Content
+// ---------------------------------------------------------------------------
+
+model Category {
+  id           String   @id @default(uuid(7)) @db.Uuid
+  name         String   @db.VarChar(100)
+  slug         String   @unique @db.VarChar(120)
+  description  String?  @db.VarChar(1000)
+  coverMediaId String?  @map("cover_media_id") @db.Uuid
+  sortOrder    Int      @default(0) @map("sort_order")
+  isPublished  Boolean  @default(false) @map("is_published")
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  coverMedia MediaAsset?         @relation(fields: [coverMediaId], references: [id], onDelete: Restrict)
+  wallpapers WallpaperCategory[]
+
+  @@index([isPublished, sortOrder])
+  @@index([sortOrder])
+  @@index([coverMediaId])
+  @@map("categories")
+}
+
+model Wallpaper {
+  id                 String               @id @default(uuid(7)) @db.Uuid
+  title              String               @db.VarChar(150)
+  description        String?              @db.VarChar(2000)
+  slug               String               @unique @db.VarChar(180)
+  originalMediaId    String               @map("original_media_id") @db.Uuid
+  orientation        WallpaperOrientation
+  width              Int
+  height             Int
+  /// Lower-cased keywords used by search.
+  tags               String[]             @default([]) @db.VarChar(40)
+  isFeatured         Boolean              @default(false) @map("is_featured")
+  isPublished        Boolean              @default(false) @map("is_published")
+  sortOrder          Int                  @default(0) @map("sort_order")
+  publishedAt        DateTime?            @map("published_at") @db.Timestamptz(3)
+  /// Denormalized counters maintained by the analytics flusher (used for "popular" sorting).
+  viewCount          Int                  @default(0) @map("view_count")
+  downloadClickCount Int                  @default(0) @map("download_click_count")
+  downloadCount      Int                  @default(0) @map("download_count")
+  createdAt          DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime             @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  originalMedia MediaAsset          @relation(fields: [originalMediaId], references: [id], onDelete: Restrict)
+  categories    WallpaperCategory[]
+  events        WallpaperEvent[]
+  dailyStats    WallpaperDailyStat[]
+
+  @@index([isPublished, publishedAt(sort: Desc)])
+  @@index([isPublished, isFeatured, sortOrder])
+  @@index([isPublished, downloadCount(sort: Desc), viewCount(sort: Desc)])
+  @@index([isPublished, sortOrder])
+  @@index([orientation])
+  @@index([createdAt(sort: Desc)])
+  @@index([originalMediaId])
+  @@index([title(ops: raw("gin_trgm_ops"))], type: Gin, map: "wallpapers_title_trgm_idx")
+  @@index([tags], type: Gin)
+  @@map("wallpapers")
+}
+
+/// Join table. Deleting a category only removes these links, never the wallpapers.
+model WallpaperCategory {
+  wallpaperId String   @map("wallpaper_id") @db.Uuid
+  categoryId  String   @map("category_id") @db.Uuid
+  assignedAt  DateTime @default(now()) @map("assigned_at") @db.Timestamptz(3)
+
+  wallpaper Wallpaper @relation(fields: [wallpaperId], references: [id], onDelete: Cascade)
+  category  Category  @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@id([wallpaperId, categoryId])
+  @@index([categoryId, wallpaperId])
+  @@map("wallpaper_categories")
+}
+
+model Banner {
+  id           String           @id @default(uuid(7)) @db.Uuid
+  title        String           @db.VarChar(150)
+  subtitle     String?          @db.VarChar(300)
+  imageMediaId String           @map("image_media_id") @db.Uuid
+  actionType   BannerActionType @default(NONE) @map("action_type")
+  /// Wallpaper id, category id or https URL depending on actionType.
+  actionValue  String?          @map("action_value") @db.VarChar(2048)
+  sortOrder    Int              @default(0) @map("sort_order")
+  isActive     Boolean          @default(false) @map("is_active")
+  startsAt     DateTime?        @map("starts_at") @db.Timestamptz(3)
+  endsAt       DateTime?        @map("ends_at") @db.Timestamptz(3)
+  createdAt    DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt    DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  imageMedia MediaAsset @relation(fields: [imageMediaId], references: [id], onDelete: Restrict)
+
+  @@index([isActive, sortOrder])
+  @@index([imageMediaId])
+  @@map("banners")
+}
+
+model HomeSection {
+  id            String          @id @default(uuid(7)) @db.Uuid
+  title         String          @db.VarChar(120)
+  sectionType   HomeSectionType @map("section_type")
+  sortOrder     Int             @default(0) @map("sort_order")
+  isEnabled     Boolean         @default(true) @map("is_enabled")
+  /// Validated per sectionType by HomeSectionsService before persisting.
+  configuration Json            @default("{}")
+  createdAt     DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  @@index([isEnabled, sortOrder])
+  @@map("home_sections")
+}
+
+/// Typed, versioned configuration documents. The `app_config` key holds the remote mobile
+/// app configuration validated by AppSettingsDto.
+model AppSetting {
+  key         String   @id @db.VarChar(64)
+  value       Json
+  version     Int      @default(1)
+  updatedById String?  @map("updated_by_id") @db.Uuid
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  updatedBy Admin? @relation(fields: [updatedById], references: [id], onDelete: SetNull)
+
+  @@map("app_settings")
+}
+
+// ---------------------------------------------------------------------------
+// Analytics
+// ---------------------------------------------------------------------------
+
+/// Raw anonymous events (no IP, no device id). Pruned after ANALYTICS_RAW_EVENT_RETENTION_DAYS.
+model WallpaperEvent {
+  id          BigInt             @id @default(autoincrement())
+  wallpaperId String             @map("wallpaper_id") @db.Uuid
+  type        WallpaperEventType
+  platform    ClientPlatform?
+  appVersion  String?            @map("app_version") @db.VarChar(32)
+  createdAt   DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  wallpaper Wallpaper @relation(fields: [wallpaperId], references: [id], onDelete: Cascade)
+
+  @@index([wallpaperId, type, createdAt])
+  @@index([createdAt])
+  @@map("wallpaper_events")
+}
+
+/// Pre-aggregated daily counters: dashboards and charts read from here instead of scanning raw events.
+model WallpaperDailyStat {
+  wallpaperId    String   @map("wallpaper_id") @db.Uuid
+  date           DateTime @db.Date
+  views          Int      @default(0)
+  downloadClicks Int      @default(0) @map("download_clicks")
+  downloads      Int      @default(0)
+
+  wallpaper Wallpaper @relation(fields: [wallpaperId], references: [id], onDelete: Cascade)
+
+  @@id([wallpaperId, date])
+  @@index([date])
+  @@map("wallpaper_daily_stats")
+}
