@@ -15,8 +15,10 @@ src/generated/
 !.env.example
 !.env.test.example
 
-# local media storage
-storage/
+# Uploaded media at the repo root (LOCAL_STORAGE_PATH).
+# Keep the leading slash: a bare `storage/` rule also ignores
+# src/modules/media/storage, and the build then fails with TS2307.
+/storage/
 
 # logs / OS / IDE
 *.log
