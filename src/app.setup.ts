@@ -2,6 +2,7 @@ import { resolve } from 'node:path';
 import { ValidationPipe } from '@nestjs/common';
 import { NestExpressApplication } from '@nestjs/platform-express';
 import cookieParser from 'cookie-parser';
+import { NextFunction, Request, Response } from 'express';
 import helmet from 'helmet';
 import { API_PREFIX, AppConfigService } from './config/app-config.type';
 import { StorageDriver } from './config/env.validation';
@@ -41,6 +42,16 @@ export function configureApp(app: NestExpressApplication): void {
     .split(',')
     .map((o) => o.trim())
     .filter(Boolean);
+  // Answer public preflight before the admin CORS middleware, which only
+  // allows dashboard origins and would otherwise end OPTIONS without headers.
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    if (!isPublicBrowserPath(req.path) || req.method !== 'OPTIONS') {
+      next();
+      return;
+    }
+    applyPublicBrowserHeaders(res);
+    res.status(204).end();
+  });
   app.enableCors({
     origin: origins.length > 0 ? origins : false,
     credentials: true,
@@ -48,6 +59,12 @@ export function configureApp(app: NestExpressApplication): void {
     allowedHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token', 'X-Request-Id'],
     exposedHeaders: ['X-Request-Id'],
     maxAge: 600,
+  });
+  // Admin stays on the allowlist above. The catalog and media files are public,
+  // and browsers (Flutter web) cannot read them while CORP is same-origin.
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    if (isPublicBrowserPath(req.path)) applyPublicBrowserHeaders(res);
+    next();
   });
 
   if (config.get('STORAGE_DRIVER', { infer: true }) === StorageDriver.Local) {
@@ -59,7 +76,7 @@ export function configureApp(app: NestExpressApplication): void {
       maxAge: '7d',
       setHeaders: (res) => {
         res.setHeader('X-Content-Type-Options', 'nosniff');
-        res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+        applyPublicBrowserHeaders(res);
       },
     });
   }
@@ -78,6 +95,23 @@ export function configureApp(app: NestExpressApplication): void {
   app.useGlobalFilters(new AllExceptionsFilter());
   app.useGlobalInterceptors(new ResponseEnvelopeInterceptor());
   app.enableShutdownHooks();
+}
+
+function isPublicBrowserPath(path: string): boolean {
+  return (
+    path === `/${API_PREFIX}/health` ||
+    path.startsWith(`/${API_PREFIX}/public`) ||
+    path.startsWith('/media/')
+  );
+}
+
+/** Lets any browser read the public catalog. `*` cannot be paired with credentialed CORS. */
+function applyPublicBrowserHeaders(res: Response): void {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Accept, X-Request-Id');
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+  res.removeHeader('Access-Control-Allow-Credentials');
 }
 
 function parseTrustProxy(value: string): boolean | number | string {
