@@ -2,6 +2,7 @@ import { Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ClientPlatform, HomeSection, HomeSectionType, Prisma, WallpaperOrientation } from '../../generated/prisma/client';
 import { EnvironmentVariables } from '../../config/env.validation';
+import { ContentLocale, resolveLocalizedText } from '../../common/i18n/content-locale';
 import { TtlCache } from '../../common/utils/ttl-cache';
 import { PrismaService } from '../../prisma/prisma.service';
 import { AppSettingsService } from '../app-settings/app-settings.service';
@@ -57,24 +58,28 @@ export class PublicHomeService {
     private readonly publicConfig: PublicConfigService,
     config: ConfigService<EnvironmentVariables, true>,
   ) {
-    this.cache = new TtlCache(config.get('PUBLIC_CACHE_TTL_SECONDS', { infer: true }) * 1000, 10);
+    this.cache = new TtlCache(config.get('PUBLIC_CACHE_TTL_SECONDS', { infer: true }) * 1000, 24);
   }
 
-  getHome(): Promise<{ sections: PublicHomeSection[] }> {
-    return this.cache.getOrLoad('home', () => this.buildHome()) as Promise<{ sections: PublicHomeSection[] }>;
+  getHome(locale: ContentLocale): Promise<{ sections: PublicHomeSection[] }> {
+    return this.cache.getOrLoad(`home:${locale}`, () => this.buildHome(locale)) as Promise<{ sections: PublicHomeSection[] }>;
   }
 
-  async getAppConfig(platform?: ClientPlatform, appVersion?: string) {
-    const sections = (await this.cache.getOrLoad('layout', () => this.enabledSections())) as HomeSection[];
-    const layout: HomeLayoutEntry[] = sections.map((s) => ({ id: s.id, title: s.title, type: s.sectionType }));
-    return this.publicConfig.build(platform, appVersion, layout);
+  async getAppConfig(platform?: ClientPlatform, appVersion?: string, locale: ContentLocale = 'en') {
+    const sections = (await this.cache.getOrLoad(`layout:${locale}`, () => this.enabledSections())) as SectionRow[];
+    const layout: HomeLayoutEntry[] = sections.map((s) => ({ id: s.id, title: sectionTitle(s, locale), type: s.sectionType }));
+    return this.publicConfig.build(platform, appVersion, layout, locale);
   }
 
-  private enabledSections(): Promise<HomeSection[]> {
-    return this.prisma.homeSection.findMany({ where: { isEnabled: true }, orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }] });
+  private enabledSections() {
+    return this.prisma.homeSection.findMany({
+      where: { isEnabled: true },
+      orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
+      include: { translations: { select: { locale: true, title: true } } },
+    });
   }
 
-  private async buildHome(): Promise<{ sections: PublicHomeSection[] }> {
+  private async buildHome(locale: ContentLocale): Promise<{ sections: PublicHomeSection[] }> {
     const [sections, settings] = await Promise.all([this.enabledSections(), this.settings.getSettings()]);
     const defaultLimit = settings.home.defaultSectionLimit;
     const cfg = <T,>(s: HomeSection) => s.configuration as unknown as T;
@@ -136,7 +141,7 @@ export class PublicHomeService {
           ...(f.type === 'FEATURED_WALLPAPERS' ? { isFeatured: true } : {}),
           ...(f.orientation ? { orientation: f.orientation } : {}),
         };
-        feedResults.set(key, await this.catalog.feed(where, publicOrderBy(FEED_SORT[f.type]!), f.limit));
+        feedResults.set(key, await this.catalog.feed(where, publicOrderBy(FEED_SORT[f.type]!), f.limit, locale));
       }),
       ...[...categoryWindows.entries()].map(async ([sort, w]) => {
         categoryWindowRows.set(sort, await this.topPerCategory([...w.categoryIds], w.limit, sort));
@@ -145,10 +150,10 @@ export class PublicHomeService {
 
     const windowWallpaperIds = [...categoryWindowRows.values()].flat().map((r) => r.wallpaperId);
     const [wallpapersById, explicitCategories, allCategories, banners] = await Promise.all([
-      this.catalog.wallpapersByIds([...new Set([...customIds, ...windowWallpaperIds])]),
-      explicitCategoryIds.size ? this.catalog.categoriesByIds([...explicitCategoryIds], explicitCategoryIds.size) : Promise.resolve([]),
-      allCategoriesLimit ? this.catalog.categoriesByIds(null, allCategoriesLimit) : Promise.resolve([]),
-      bannerLimit && settings.home.bannersEnabled ? this.banners.listPublic(bannerLimit) : Promise.resolve([]),
+      this.catalog.wallpapersByIds([...new Set([...customIds, ...windowWallpaperIds])], locale),
+      explicitCategoryIds.size ? this.catalog.categoriesByIds([...explicitCategoryIds], explicitCategoryIds.size, locale) : Promise.resolve([]),
+      allCategoriesLimit ? this.catalog.categoriesByIds(null, allCategoriesLimit, locale) : Promise.resolve([]),
+      bannerLimit && settings.home.bannersEnabled ? this.banners.listPublic(bannerLimit, locale) : Promise.resolve([]),
     ]);
     const categoriesById = new Map([...explicitCategories, ...allCategories].map((c) => [c.id, c]));
 
@@ -156,7 +161,7 @@ export class PublicHomeService {
     const out: PublicHomeSection[] = [];
     for (const s of sections) {
       const limit = limitOf(s);
-      const base = { id: s.id, title: s.title, type: s.sectionType };
+      const base = { id: s.id, title: sectionTitle(s, locale), type: s.sectionType };
       switch (s.sectionType) {
         case 'FEATURED_WALLPAPERS':
         case 'POPULAR_WALLPAPERS':
@@ -223,4 +228,14 @@ export class PublicHomeService {
       ORDER BY t.category_id, t.rn`;
     return rows.map((r) => ({ wallpaperId: r.wallpaper_id, categoryId: r.category_id }));
   }
+}
+
+type SectionRow = Prisma.HomeSectionGetPayload<{ include: { translations: { select: { locale: true; title: true } } } }>;
+
+function sectionTitle(section: SectionRow, locale: ContentLocale): string {
+  return resolveLocalizedText(
+    section.translations.map((row) => ({ locale: row.locale, primary: row.title, secondary: null })),
+    locale,
+    { primary: section.title, secondary: null },
+  ).primary;
 }

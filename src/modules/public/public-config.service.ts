@@ -1,5 +1,6 @@
 import { Injectable } from '@nestjs/common';
 import { ClientPlatform } from '../../generated/prisma/enums';
+import { ContentLocale, resolveLocalizedText } from '../../common/i18n/content-locale';
 import { compareVersions } from '../../common/utils/semver.util';
 import { AppSettings } from '../app-settings/app-settings.defaults';
 import { AppSettingsService } from '../app-settings/app-settings.service';
@@ -21,7 +22,7 @@ export interface HomeLayoutEntry {
 export class PublicConfigService {
   constructor(private readonly settings: AppSettingsService) {}
 
-  async build(platform?: ClientPlatform, appVersion?: string, homeLayout: HomeLayoutEntry[] = []) {
+  async build(platform?: ClientPlatform, appVersion?: string, homeLayout: HomeLayoutEntry[] = [], locale: ContentLocale = 'en') {
     const s = await this.settings.getSettings();
     const now = Date.now();
     return {
@@ -43,15 +44,22 @@ export class PublicConfigService {
             (!a.startsAt || Date.parse(a.startsAt) <= now) &&
             (!a.endsAt || Date.parse(a.endsAt) > now),
         )
-        .map((a) => ({
-          id: a.id,
-          title: a.title,
-          message: a.message,
-          level: a.level,
-          actionUrl: a.actionUrl,
-          dismissible: a.dismissible,
-          endsAt: a.endsAt,
-        })),
+        .map((a) => {
+          const text = resolveLocalizedText(
+            (a.translations ?? []).map((row) => ({ locale: row.locale, primary: row.title, secondary: row.message })),
+            locale,
+            { primary: a.title, secondary: a.message },
+          );
+          return {
+            id: a.id,
+            title: text.primary,
+            message: text.secondary ?? '',
+            level: a.level,
+            actionUrl: a.actionUrl,
+            dismissible: a.dismissible,
+            endsAt: a.endsAt,
+          };
+        }),
       downloads: {
         enabled: s.downloads.enabled,
         allowOriginalDownload: s.downloads.allowOriginalDownload,

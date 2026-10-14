@@ -19,6 +19,7 @@ export class PublicCacheInterceptor implements NestInterceptor {
     return next.handle().pipe(
       tap(() => {
         if (req.method === 'GET' && res.statusCode === 200 && !res.getHeader('Cache-Control')) {
+          res.setHeader('Vary', 'Accept-Language');
           res.setHeader(
             'Cache-Control',
             this.maxAge > 0 ? `public, max-age=${this.maxAge}, stale-while-revalidate=${this.maxAge * 2}` : 'no-cache',

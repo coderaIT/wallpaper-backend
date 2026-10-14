@@ -2,6 +2,7 @@ import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
 import { IsEnum, IsIn, IsOptional, IsString, IsUUID, Matches, MaxLength, MinLength } from 'class-validator';
 import { PaginationQueryDto } from '../../../common/dto/pagination.dto';
+import { CONTENT_LOCALES, ContentLocale } from '../../../common/i18n/content-locale';
 import { SLUG_PATTERN } from '../../../common/utils/slug.util';
 import { ClientPlatform, WallpaperOrientation } from '../../../generated/prisma/enums';
 
@@ -13,6 +14,17 @@ export enum PublicWallpaperSort {
   Downloads = 'downloads',
   Featured = 'featured',
   Manual = 'manual',
+  Random = 'random',
+}
+
+export class PublicLocaleQueryDto {
+  @ApiPropertyOptional({
+    enum: CONTENT_LOCALES,
+    description: 'Overrides Accept-Language. Unsupported values are rejected. When omitted, Accept-Language is used, then English.',
+  })
+  @IsOptional()
+  @IsIn(CONTENT_LOCALES)
+  lang?: ContentLocale;
 }
 
 class PublicWallpaperFiltersDto extends PaginationQueryDto {
@@ -36,6 +48,19 @@ class PublicWallpaperFiltersDto extends PaginationQueryDto {
   @IsOptional()
   @IsEnum(PublicWallpaperSort)
   sort: PublicWallpaperSort = PublicWallpaperSort.Latest;
+
+  @ApiPropertyOptional({
+    description: 'Stable session key for sort=random. Reuse the same seed while paging. A new seed starts a new order. 8-64 letters, digits, _ or -.',
+    example: 'a1b2c3d4e5f67890',
+  })
+  @IsOptional()
+  @Matches(/^[A-Za-z0-9_-]{8,64}$/)
+  seed?: string;
+
+  @ApiPropertyOptional({ enum: CONTENT_LOCALES })
+  @IsOptional()
+  @IsIn(CONTENT_LOCALES)
+  lang?: ContentLocale;
 }
 
 export class PublicWallpapersQueryDto extends PublicWallpaperFiltersDto {
@@ -57,11 +82,23 @@ export class PublicSearchQueryDto extends PublicWallpaperFiltersDto {
   q: string;
 }
 
+export class PublicListQueryDto extends PaginationQueryDto {
+  @ApiPropertyOptional({ enum: CONTENT_LOCALES })
+  @IsOptional()
+  @IsIn(CONTENT_LOCALES)
+  lang?: ContentLocale;
+}
+
 export class PublicFeedQueryDto extends PaginationQueryDto {
   @ApiPropertyOptional({ enum: WallpaperOrientation })
   @IsOptional()
   @IsEnum(WallpaperOrientation)
   orientation?: WallpaperOrientation;
+
+  @ApiPropertyOptional({ enum: CONTENT_LOCALES })
+  @IsOptional()
+  @IsIn(CONTENT_LOCALES)
+  lang?: ContentLocale;
 }
 
 export class AppConfigQueryDto {
@@ -74,6 +111,11 @@ export class AppConfigQueryDto {
   @IsOptional()
   @Matches(/^\d{1,4}\.\d{1,4}\.\d{1,4}$/, { message: 'appVersion must be MAJOR.MINOR.PATCH' })
   appVersion?: string;
+
+  @ApiPropertyOptional({ enum: CONTENT_LOCALES })
+  @IsOptional()
+  @IsIn(CONTENT_LOCALES)
+  lang?: ContentLocale;
 }
 
 export class PublicWallpaperSummaryDto {

@@ -267,3 +267,24 @@ function refresh(): Promise<boolean> {
   return refreshing;
 }
 ```
+
+## Localization, random order, related wallpapers, and category deletion
+
+These contracts were added without changing existing identifiers. Image URLs and IDs are never translated.
+
+**Locale.** Public catalog, home, banner, section, announcement, and app-config reads accept `lang=ar|tr|en`. Precedence is:
+
+1. An explicit `lang` query when it is `ar`, `tr`, or `en`.
+2. The first supported tag in `Accept-Language`, ordered by quality.
+3. English.
+
+Text fallback is the requested locale, then the English translation, then the legacy parent column, then any other stored translation (`ar`, then `tr`). Empty strings count as missing. The migration does not invent translations for existing names; those rows keep their legacy text until an administrator saves a translation. Responses set `Vary: Accept-Language`.
+
+Admin create and update bodies accept `translations: [{ locale, name|title, description|subtitle|message }]`. When that array is present it replaces the stored rows. When it is omitted, a legacy `name` or `title` still updates the English row so older clients keep working.
+
+**Random order.** `GET /api/v1/public/wallpapers?sort=random&seed=<8-64 url-safe characters>`. If `seed` is omitted the server generates one and returns it in `meta.seed`. Reuse that seed for later pages. Order is `md5(id || ':' || seed)`, then `id`, with the existing offset pagination. It is stable for one seed and does not use `ORDER BY random()`. Admin lists are not randomized. Featured, popular, latest, and search keep their existing sorts.
+
+**Related wallpapers.** `GET /api/v1/public/wallpapers/:id/related?page=1&limit=20` is registered before `GET /wallpapers/:id`. Ranking uses shared categories, then shared tags, then the same orientation. Published wallpapers with no overlap remain as a fallback. The source wallpaper is excluded.
+
+**Category deletion.** `GET /api/v1/admin/categories/:id/deletion-impact` returns associated, exclusive, and shared wallpaper counts plus media eligible for cleanup. `DELETE /api/v1/admin/categories/:id?deleteExclusiveWallpapers=true` deletes the category and, only when that flag is true, wallpapers whose only category is the one being deleted. Shared wallpapers stay. Media files are removed after the transaction only when nothing else references them. The operation is written to the audit log. The default remains `deleteExclusiveWallpapers=false`.
+

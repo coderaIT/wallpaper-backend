@@ -63,6 +63,13 @@ enum ClientPlatform {
   OTHER
 }
 
+/// Public content languages. Missing rows fall back; they are not invented.
+enum ContentLocale {
+  ar
+  tr
+  en
+}
+
 // ---------------------------------------------------------------------------
 // Administration & authentication
 // ---------------------------------------------------------------------------
@@ -186,8 +193,9 @@ model Category {
   createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt    DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  coverMedia MediaAsset?         @relation(fields: [coverMediaId], references: [id], onDelete: Restrict)
-  wallpapers WallpaperCategory[]
+  coverMedia   MediaAsset?           @relation(fields: [coverMediaId], references: [id], onDelete: Restrict)
+  wallpapers   WallpaperCategory[]
+  translations CategoryTranslation[]
 
   @@index([isPublished, sortOrder])
   @@index([sortOrder])
@@ -217,8 +225,9 @@ model Wallpaper {
   createdAt          DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt          DateTime             @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  originalMedia MediaAsset          @relation(fields: [originalMediaId], references: [id], onDelete: Restrict)
+  originalMedia MediaAsset             @relation(fields: [originalMediaId], references: [id], onDelete: Restrict)
   categories    WallpaperCategory[]
+  translations  WallpaperTranslation[]
   events        WallpaperEvent[]
   dailyStats    WallpaperDailyStat[]
 
@@ -263,7 +272,8 @@ model Banner {
   createdAt    DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt    DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
 
-  imageMedia MediaAsset @relation(fields: [imageMediaId], references: [id], onDelete: Restrict)
+  imageMedia   MediaAsset          @relation(fields: [imageMediaId], references: [id], onDelete: Restrict)
+  translations BannerTranslation[]
 
   @@index([isActive, sortOrder])
   @@index([imageMediaId])
@@ -277,12 +287,70 @@ model HomeSection {
   sortOrder     Int             @default(0) @map("sort_order")
   isEnabled     Boolean         @default(true) @map("is_enabled")
   /// Validated per sectionType by HomeSectionsService before persisting.
-  configuration Json            @default("{}")
-  createdAt     DateTime        @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt     DateTime        @updatedAt @map("updated_at") @db.Timestamptz(3)
+  configuration Json                     @default("{}")
+  createdAt     DateTime                 @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime                 @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  translations HomeSectionTranslation[]
 
   @@index([isEnabled, sortOrder])
   @@map("home_sections")
+}
+
+/// One category, many locales. Existing names stay on `categories` until an admin saves a translation.
+model CategoryTranslation {
+  id          String        @id @default(uuid(7)) @db.Uuid
+  categoryId  String        @map("category_id") @db.Uuid
+  locale      ContentLocale
+  name        String        @db.VarChar(100)
+  description String?       @db.VarChar(1000)
+
+  category Category @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+
+  @@unique([categoryId, locale])
+  @@index([locale])
+  @@map("category_translations")
+}
+
+model WallpaperTranslation {
+  id          String        @id @default(uuid(7)) @db.Uuid
+  wallpaperId String        @map("wallpaper_id") @db.Uuid
+  locale      ContentLocale
+  title       String        @db.VarChar(150)
+  description String?       @db.VarChar(2000)
+
+  wallpaper Wallpaper @relation(fields: [wallpaperId], references: [id], onDelete: Cascade)
+
+  @@unique([wallpaperId, locale])
+  @@index([locale])
+  @@map("wallpaper_translations")
+}
+
+model BannerTranslation {
+  id       String        @id @default(uuid(7)) @db.Uuid
+  bannerId String        @map("banner_id") @db.Uuid
+  locale   ContentLocale
+  title    String        @db.VarChar(150)
+  subtitle String?       @db.VarChar(300)
+
+  banner Banner @relation(fields: [bannerId], references: [id], onDelete: Cascade)
+
+  @@unique([bannerId, locale])
+  @@index([locale])
+  @@map("banner_translations")
+}
+
+model HomeSectionTranslation {
+  id            String        @id @default(uuid(7)) @db.Uuid
+  homeSectionId String        @map("home_section_id") @db.Uuid
+  locale        ContentLocale
+  title         String        @db.VarChar(120)
+
+  homeSection HomeSection @relation(fields: [homeSectionId], references: [id], onDelete: Cascade)
+
+  @@unique([homeSectionId, locale])
+  @@index([locale])
+  @@map("home_section_translations")
 }
 
 /// Typed, versioned configuration documents. The `app_config` key holds the remote mobile

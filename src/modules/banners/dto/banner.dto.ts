@@ -1,8 +1,11 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
 import {
+  ArrayMaxSize,
+  IsArray,
   IsBoolean,
   IsEnum,
+  IsIn,
   IsInt,
   IsISO8601,
   IsOptional,
@@ -13,12 +16,36 @@ import {
   Min,
   MinLength,
   ValidateIf,
+  ValidateNested,
 } from 'class-validator';
+import { Type } from 'class-transformer';
 import { PaginationQueryDto } from '../../../common/dto/pagination.dto';
+import { CONTENT_LOCALES, ContentLocale } from '../../../common/i18n/content-locale';
 import { BannerActionType } from '../../../generated/prisma/enums';
 
 const trim = ({ value }: { value: unknown }) => (typeof value === 'string' ? value.trim() : value);
 const toBool = ({ value }: { value: unknown }) => (value === 'true' ? true : value === 'false' ? false : value);
+
+export class BannerTranslationInputDto {
+  @ApiProperty({ enum: CONTENT_LOCALES })
+  @IsIn(CONTENT_LOCALES)
+  locale!: ContentLocale;
+
+  @ApiProperty({ maxLength: 150 })
+  @Transform(trim)
+  @IsString()
+  @MinLength(1)
+  @MaxLength(150)
+  title!: string;
+
+  @ApiPropertyOptional({ nullable: true })
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @Transform(trim)
+  @IsString()
+  @MaxLength(300)
+  subtitle?: string | null;
+}
 
 export class CreateBannerDto {
   @ApiProperty({ example: 'Summer collection' })
@@ -78,6 +105,14 @@ export class CreateBannerDto {
   @ValidateIf((_, v) => v !== null)
   @IsISO8601({ strict: true })
   endsAt?: string | null;
+
+  @ApiPropertyOptional({ type: [BannerTranslationInputDto] })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(3)
+  @ValidateNested({ each: true })
+  @Type(() => BannerTranslationInputDto)
+  translations?: BannerTranslationInputDto[];
 }
 
 export class UpdateBannerDto {
@@ -137,6 +172,14 @@ export class UpdateBannerDto {
   @ValidateIf((_, v) => v !== null)
   @IsISO8601({ strict: true })
   endsAt?: string | null;
+
+  @ApiPropertyOptional({ type: [BannerTranslationInputDto] })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(3)
+  @ValidateNested({ each: true })
+  @Type(() => BannerTranslationInputDto)
+  translations?: BannerTranslationInputDto[];
 }
 
 export class ListBannersQueryDto extends PaginationQueryDto {
@@ -159,6 +202,8 @@ export class BannerResponseDto {
   @ApiProperty({ nullable: true, type: String, format: 'date-time' }) endsAt: Date | null;
   @ApiProperty({ example: { mediaId: '...', thumbnailUrl: '...', previewUrl: '...', originalUrl: '...' } })
   image: { mediaId: string; thumbnailUrl: string; previewUrl: string; originalUrl: string };
+  @ApiProperty({ type: 'array', items: { type: 'object' } })
+  translations!: { locale: ContentLocale; title: string; subtitle: string | null }[];
   @ApiProperty({ type: String, format: 'date-time' }) createdAt: Date;
   @ApiProperty({ type: String, format: 'date-time' }) updatedAt: Date;
 }

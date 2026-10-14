@@ -7,6 +7,7 @@ import {
   IsArray,
   IsBoolean,
   IsEnum,
+  IsIn,
   IsInt,
   IsOptional,
   IsString,
@@ -22,6 +23,7 @@ import {
 import { PaginationQueryDto } from '../../../common/dto/pagination.dto';
 import { ReorderItemDto } from '../../../common/dto/reorder.dto';
 import { SortDirection } from '../../../common/dto/sort.dto';
+import { CONTENT_LOCALES, ContentLocale } from '../../../common/i18n/content-locale';
 import { SLUG_PATTERN } from '../../../common/utils/slug.util';
 import { WallpaperOrientation } from '../../../generated/prisma/enums';
 
@@ -33,6 +35,33 @@ const normalizeTags = ({ value }: { value: unknown }) =>
     : value;
 
 export const TAG_PATTERN = /^[\p{L}\p{N}][\p{L}\p{N} _-]{0,39}$/u;
+
+export class WallpaperTranslationInputDto {
+  @ApiProperty({ enum: CONTENT_LOCALES })
+  @IsIn(CONTENT_LOCALES)
+  locale!: ContentLocale;
+
+  @ApiProperty({ maxLength: 150 })
+  @Transform(trim)
+  @IsString()
+  @MinLength(1)
+  @MaxLength(150)
+  title!: string;
+
+  @ApiPropertyOptional({ nullable: true })
+  @IsOptional()
+  @ValidateIf((_, value) => value !== null)
+  @Transform(trim)
+  @IsString()
+  @MaxLength(2000)
+  description?: string | null;
+}
+
+export class WallpaperTranslationDto {
+  @ApiProperty({ enum: CONTENT_LOCALES }) locale!: ContentLocale;
+  @ApiProperty() title!: string;
+  @ApiProperty({ nullable: true, type: String }) description!: string | null;
+}
 
 export class CreateWallpaperDto {
   @ApiProperty({ example: 'Mountain Sunrise', maxLength: 150 })
@@ -92,6 +121,14 @@ export class CreateWallpaperDto {
   @Min(0)
   @Max(1_000_000)
   sortOrder?: number;
+
+  @ApiPropertyOptional({ type: [WallpaperTranslationInputDto] })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(3)
+  @ValidateNested({ each: true })
+  @Type(() => WallpaperTranslationInputDto)
+  translations?: WallpaperTranslationInputDto[];
 }
 
 export class UpdateWallpaperDto {
@@ -154,6 +191,14 @@ export class UpdateWallpaperDto {
   @Min(0)
   @Max(1_000_000)
   sortOrder?: number;
+
+  @ApiPropertyOptional({ type: [WallpaperTranslationInputDto], description: 'Replaces the translation set when present' })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(3)
+  @ValidateNested({ each: true })
+  @Type(() => WallpaperTranslationInputDto)
+  translations?: WallpaperTranslationInputDto[];
 }
 
 export class PublishWallpaperDto {
@@ -380,6 +425,7 @@ export class WallpaperAdminResponseDto {
   @ApiProperty({ format: 'uuid' }) id: string;
   @ApiProperty() title: string;
   @ApiProperty({ nullable: true, type: String }) description: string | null;
+  @ApiProperty({ type: [WallpaperTranslationDto] }) translations!: WallpaperTranslationDto[];
   @ApiProperty() slug: string;
   @ApiProperty({ type: [String] }) tags: string[];
   @ApiProperty({ enum: WallpaperOrientation }) orientation: WallpaperOrientation;

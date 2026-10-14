@@ -2,6 +2,8 @@ import { BadRequestException, Injectable, NotFoundException } from '@nestjs/comm
 import { ConfigService } from '@nestjs/config';
 import { isUUID } from 'class-validator';
 import { BannerActionType, Prisma } from '../../generated/prisma/client';
+import { ContentLocale, resolveLocalizedText, resolveWriteTexts, TranslationDraft } from '../../common/i18n/content-locale';
+import { syncBannerTranslations } from '../../common/i18n/persist-translations';
 import { EnvironmentVariables } from '../../config/env.validation';
 import { RequestMeta } from '../../common/decorators/request-meta.decorator';
 import { Paginated, toSkipTake } from '../../common/dto/pagination.dto';
@@ -15,7 +17,10 @@ import { MEDIA_URL_SELECT, MediaUrlService } from '../media/media-url.service';
 import { MediaService } from '../media/media.service';
 import { BannerResponseDto, CreateBannerDto, ListBannersQueryDto, UpdateBannerDto } from './dto/banner.dto';
 
-const BANNER_INCLUDE = { imageMedia: { select: MEDIA_URL_SELECT } } satisfies Prisma.BannerInclude;
+const BANNER_INCLUDE = {
+  imageMedia: { select: MEDIA_URL_SELECT },
+  translations: { select: { locale: true, title: true, subtitle: true }, orderBy: { locale: 'asc' as const } },
+} satisfies Prisma.BannerInclude;
 type BannerWithImage = Prisma.BannerGetPayload<{ include: typeof BANNER_INCLUDE }>;
 
 export interface PublicBannerDto {
@@ -73,12 +78,14 @@ export class BannersService {
     const endsAt = dto.endsAt ? new Date(dto.endsAt) : null;
     assertSchedule(startsAt, endsAt);
     const sortOrder = dto.sortOrder ?? (await this.nextSortOrder());
+    const write = this.textsForWrite(dto.translations, dto.title, dto.subtitle ?? null, null);
+    if (!write?.parent.primary) throw new BadRequestException('Banner title is required');
 
     const banner = await this.prisma.$transaction(async (tx) => {
       const created = await tx.banner.create({
         data: {
-          title: dto.title,
-          subtitle: dto.subtitle ?? null,
+          title: write.parent.primary,
+          subtitle: write.parent.secondary,
           imageMediaId: dto.imageMediaId,
           actionType: dto.actionType,
           actionValue,
@@ -87,20 +94,21 @@ export class BannersService {
           startsAt,
           endsAt,
         },
-        include: BANNER_INCLUDE,
       });
+      await syncBannerTranslations(tx, created.id, write.rows, write.replace);
+      const full = await tx.banner.findUniqueOrThrow({ where: { id: created.id }, include: BANNER_INCLUDE });
       await this.audit.record(
         {
           adminId: actor.id,
           action: AuditAction.BannerCreated,
           entityType: AuditEntity.Banner,
-          entityId: created.id,
-          metadata: { title: created.title, actionType: created.actionType, actionValue, isActive: created.isActive },
+          entityId: full.id,
+          metadata: { title: full.title, actionType: full.actionType, actionValue, isActive: full.isActive },
           meta,
         },
         tx,
       );
-      return created;
+      return full;
     });
     return this.toResponse(banner);
   }
@@ -118,13 +126,18 @@ export class BannersService {
     const startsAt = dto.startsAt !== undefined ? (dto.startsAt ? new Date(dto.startsAt) : null) : existing.startsAt;
     const endsAt = dto.endsAt !== undefined ? (dto.endsAt ? new Date(dto.endsAt) : null) : existing.endsAt;
     assertSchedule(startsAt, endsAt);
+    const write = this.textsForWrite(dto.translations, dto.title, dto.subtitle, {
+      primary: existing.title,
+      secondary: existing.subtitle,
+    });
+    if (write && !write.parent.primary) throw new BadRequestException('Banner title is required');
 
     const banner = await this.prisma.$transaction(async (tx) => {
+      if (write) await syncBannerTranslations(tx, id, write.rows, write.replace);
       const updated = await tx.banner.update({
         where: { id },
         data: {
-          ...(dto.title !== undefined ? { title: dto.title } : {}),
-          ...(dto.subtitle !== undefined ? { subtitle: dto.subtitle } : {}),
+          ...(write ? { title: write.parent.primary, subtitle: write.parent.secondary } : {}),
           ...(dto.imageMediaId !== undefined ? { imageMediaId: dto.imageMediaId } : {}),
           ...(dto.isActive !== undefined ? { isActive: dto.isActive } : {}),
           ...(dto.sortOrder !== undefined ? { sortOrder: dto.sortOrder } : {}),
@@ -172,7 +185,7 @@ export class BannersService {
    * Active banners inside their schedule whose targets are still publicly visible.
    * Targets are resolved with one query per target type (no N+1).
    */
-  async listPublic(limit: number): Promise<PublicBannerDto[]> {
+  async listPublic(limit: number, locale: ContentLocale = 'en'): Promise<PublicBannerDto[]> {
     const now = new Date();
     const banners = await this.prisma.banner.findMany({
       where: {
@@ -202,10 +215,15 @@ export class BannersService {
       if (!action) continue;
       const { previewUrl, thumbnailUrl } = this.urls.urls(b.imageMedia);
       const preview = b.imageMedia.variants.find((v) => v.variantType === 'PREVIEW') ?? b.imageMedia;
+      const text = resolveLocalizedText(
+        b.translations.map((row) => ({ locale: row.locale, primary: row.title, secondary: row.subtitle })),
+        locale,
+        { primary: b.title, secondary: b.subtitle },
+      );
       out.push({
         id: b.id,
-        title: b.title,
-        subtitle: b.subtitle,
+        title: text.primary,
+        subtitle: text.secondary,
         imageUrl: previewUrl,
         thumbnailUrl,
         width: preview.width,
@@ -276,9 +294,24 @@ export class BannersService {
       startsAt: b.startsAt,
       endsAt: b.endsAt,
       image: { mediaId: b.imageMedia.id, ...this.urls.urls(b.imageMedia) },
+      translations: b.translations.map((row) => ({ locale: row.locale, title: row.title, subtitle: row.subtitle })),
       createdAt: b.createdAt,
       updatedAt: b.updatedAt,
     };
+  }
+
+  private textsForWrite(
+    translations: CreateBannerDto['translations'],
+    legacyPrimary: string | undefined,
+    legacySecondary: string | null | undefined,
+    previous: { primary: string; secondary: string | null } | null,
+  ) {
+    const drafts: TranslationDraft[] | undefined = translations?.map((row) => ({
+      locale: row.locale,
+      primary: row.title,
+      secondary: row.subtitle ?? null,
+    }));
+    return resolveWriteTexts({ translations: drafts, legacyPrimary, legacySecondary, previous });
   }
 
   private async nextSortOrder(): Promise<number> {

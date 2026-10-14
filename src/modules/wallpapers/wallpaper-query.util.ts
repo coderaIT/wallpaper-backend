@@ -20,7 +20,13 @@ export function wallpaperSearchFilter(search: string, includeDescription: boolea
     OR: [
       { title: { contains: pattern, mode: 'insensitive' } },
       { tags: { has: term.toLowerCase() } },
-      ...(includeDescription ? [{ description: { contains: pattern, mode: 'insensitive' as const } }] : []),
+      { translations: { some: { title: { contains: pattern, mode: 'insensitive' } } } },
+      ...(includeDescription
+        ? [
+            { description: { contains: pattern, mode: 'insensitive' as const } },
+            { translations: { some: { description: { contains: pattern, mode: 'insensitive' as const } } } },
+          ]
+        : []),
     ],
   };
 }

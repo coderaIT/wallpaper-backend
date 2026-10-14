@@ -4,6 +4,8 @@ import { validate } from 'class-validator';
 import { HomeSection, HomeSectionType, Prisma } from '../../generated/prisma/client';
 import { RequestMeta } from '../../common/decorators/request-meta.decorator';
 import { assertUniqueIds, ReorderDto } from '../../common/dto/reorder.dto';
+import { resolveWriteTexts } from '../../common/i18n/content-locale';
+import { syncHomeSectionTranslations } from '../../common/i18n/persist-translations';
 import { PrismaService } from '../../prisma/prisma.service';
 import { AuditAction, AuditEntity } from '../audit-logs/audit-actions';
 import { AuditLogsService } from '../audit-logs/audit-logs.service';
@@ -17,6 +19,8 @@ import {
   UpdateHomeSectionDto,
 } from './dto/home-section.dto';
 
+const SECTION_INCLUDE = { translations: { select: { locale: true, title: true }, orderBy: { locale: 'asc' as const } } } satisfies Prisma.HomeSectionInclude;
+
 @Injectable()
 export class HomeSectionsService {
   constructor(
@@ -24,62 +28,77 @@ export class HomeSectionsService {
     private readonly audit: AuditLogsService,
   ) {}
 
-  list(): Promise<HomeSection[]> {
-    return this.prisma.homeSection.findMany({ orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }] });
+  list() {
+    return this.prisma.homeSection.findMany({ orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }], include: SECTION_INCLUDE });
   }
 
-  async get(id: string): Promise<HomeSection> {
-    const section = await this.prisma.homeSection.findUnique({ where: { id } });
+  async get(id: string) {
+    const section = await this.prisma.homeSection.findUnique({ where: { id }, include: SECTION_INCLUDE });
     if (!section) throw new NotFoundException('Home section not found');
     return section;
   }
 
-  async create(dto: CreateHomeSectionDto, actor: AuthenticatedAdmin, meta: RequestMeta): Promise<HomeSection> {
+  async create(dto: CreateHomeSectionDto, actor: AuthenticatedAdmin, meta: RequestMeta) {
     const configuration = await this.validateConfiguration(dto.sectionType, dto.configuration ?? {});
     const sortOrder = dto.sortOrder ?? (await this.nextSortOrder());
+    const write = resolveWriteTexts({
+      translations: dto.translations?.map((row) => ({ locale: row.locale, primary: row.title, secondary: null })),
+      legacyPrimary: dto.title,
+      previous: null,
+    });
+    if (!write?.parent.primary) throw new BadRequestException('Section title is required');
     return this.prisma.$transaction(async (tx) => {
       const section = await tx.homeSection.create({
         data: {
-          title: dto.title,
+          title: write.parent.primary,
           sectionType: dto.sectionType,
           isEnabled: dto.isEnabled ?? true,
           sortOrder,
           configuration: configuration as Prisma.InputJsonValue,
         },
       });
+      await syncHomeSectionTranslations(tx, section.id, write.rows, write.replace);
+      const full = await tx.homeSection.findUniqueOrThrow({ where: { id: section.id }, include: SECTION_INCLUDE });
       await this.audit.record(
         {
           adminId: actor.id,
           action: AuditAction.HomeSectionCreated,
           entityType: AuditEntity.HomeSection,
           entityId: section.id,
-          metadata: { title: section.title, sectionType: section.sectionType },
+          metadata: { title: full.title, sectionType: full.sectionType },
           meta,
         },
         tx,
       );
-      return section;
+      return full;
     });
   }
 
-  async update(id: string, dto: UpdateHomeSectionDto, actor: AuthenticatedAdmin, meta: RequestMeta): Promise<HomeSection> {
+  async update(id: string, dto: UpdateHomeSectionDto, actor: AuthenticatedAdmin, meta: RequestMeta) {
     const existing = await this.get(id);
     const type = dto.sectionType ?? existing.sectionType;
     const needsValidation = dto.configuration !== undefined || dto.sectionType !== undefined;
     const configuration = needsValidation
       ? await this.validateConfiguration(type, dto.configuration ?? (existing.configuration as Record<string, unknown>))
       : undefined;
+    const write = resolveWriteTexts({
+      translations: dto.translations?.map((row) => ({ locale: row.locale, primary: row.title, secondary: null })),
+      legacyPrimary: dto.title,
+      previous: { primary: existing.title, secondary: null },
+    });
 
     return this.prisma.$transaction(async (tx) => {
+      if (write) await syncHomeSectionTranslations(tx, id, write.rows, write.replace);
       const section = await tx.homeSection.update({
         where: { id },
         data: {
-          ...(dto.title !== undefined ? { title: dto.title } : {}),
+          ...(write ? { title: write.parent.primary } : {}),
           ...(dto.sectionType !== undefined ? { sectionType: dto.sectionType } : {}),
           ...(dto.isEnabled !== undefined ? { isEnabled: dto.isEnabled } : {}),
           ...(dto.sortOrder !== undefined ? { sortOrder: dto.sortOrder } : {}),
           ...(configuration !== undefined ? { configuration: configuration as Prisma.InputJsonValue } : {}),
         },
+        include: SECTION_INCLUDE,
       });
       await this.audit.record(
         {

@@ -17,8 +17,11 @@ import {
   MaxLength,
   Min,
   MinLength,
+  ValidateNested,
 } from 'class-validator';
+import { Type } from 'class-transformer';
 import { HomeSectionType, WallpaperOrientation } from '../../../generated/prisma/enums';
+import { CONTENT_LOCALES, ContentLocale } from '../../../common/i18n/content-locale';
 
 const trim = ({ value }: { value: unknown }) => (typeof value === 'string' ? value.trim() : value);
 
@@ -31,6 +34,19 @@ export const CONFIG_EXAMPLES: Record<HomeSectionType, Record<string, unknown>> =
   CUSTOM_WALLPAPERS: { wallpaperIds: ['01928c1e-0000-7000-8000-00000000a001'] },
   CATEGORIES: { categoryIds: null, limit: 12 },
 };
+
+export class HomeSectionTranslationInputDto {
+  @ApiProperty({ enum: CONTENT_LOCALES })
+  @IsIn(CONTENT_LOCALES)
+  locale!: ContentLocale;
+
+  @ApiProperty({ maxLength: 120 })
+  @Transform(trim)
+  @IsString()
+  @MinLength(1)
+  @MaxLength(120)
+  title!: string;
+}
 
 export class CreateHomeSectionDto {
   @ApiProperty({ example: 'Featured' })
@@ -63,6 +79,14 @@ export class CreateHomeSectionDto {
   @IsOptional()
   @IsObject()
   configuration?: Record<string, unknown>;
+
+  @ApiPropertyOptional({ type: [HomeSectionTranslationInputDto] })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(3)
+  @ValidateNested({ each: true })
+  @Type(() => HomeSectionTranslationInputDto)
+  translations?: HomeSectionTranslationInputDto[];
 }
 
 export class UpdateHomeSectionDto {
@@ -95,6 +119,14 @@ export class UpdateHomeSectionDto {
   @IsOptional()
   @IsObject()
   configuration?: Record<string, unknown>;
+
+  @ApiPropertyOptional({ type: [HomeSectionTranslationInputDto] })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(3)
+  @ValidateNested({ each: true })
+  @Type(() => HomeSectionTranslationInputDto)
+  translations?: HomeSectionTranslationInputDto[];
 }
 
 // ---- Per-type configuration schemas ----
@@ -171,4 +203,6 @@ export class HomeSectionResponseDto {
   @ApiProperty({ type: 'object', additionalProperties: true }) configuration: Record<string, unknown>;
   @ApiProperty({ type: String, format: 'date-time' }) createdAt: Date;
   @ApiProperty({ type: String, format: 'date-time' }) updatedAt: Date;
+  @ApiProperty({ type: 'array', items: { type: 'object' } })
+  translations?: { locale: string; title: string }[];
 }

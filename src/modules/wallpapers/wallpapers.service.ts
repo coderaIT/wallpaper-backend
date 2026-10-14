@@ -3,7 +3,10 @@ import { Prisma } from '../../generated/prisma/client';
 import { RequestMeta } from '../../common/decorators/request-meta.decorator';
 import { Paginated, toSkipTake } from '../../common/dto/pagination.dto';
 import { assertUniqueIds } from '../../common/dto/reorder.dto';
+import { resolveWriteTexts, TranslationDraft } from '../../common/i18n/content-locale';
+import { syncWallpaperTranslations } from '../../common/i18n/persist-translations';
 import { toItemError } from '../../common/utils/bulk.util';
+import { lockWallpaperRows } from '../../common/utils/row-lock';
 import { generateUniqueSlug } from '../../common/utils/slug.util';
 import { PrismaService } from '../../prisma/prisma.service';
 import { AuditAction, AuditEntity } from '../audit-logs/audit-actions';
@@ -27,6 +30,7 @@ import { orientationOf, wallpaperOrderBy, wallpaperSearchFilter } from './wallpa
 
 export const WALLPAPER_ADMIN_INCLUDE = {
   originalMedia: { select: MEDIA_URL_SELECT },
+  translations: { select: { locale: true, title: true, description: true }, orderBy: { locale: 'asc' as const } },
   categories: {
     select: { category: { select: { id: true, name: true, slug: true } } },
     orderBy: { category: { sortOrder: 'asc' } },
@@ -56,15 +60,18 @@ export class WallpapersService {
   async create(dto: CreateWallpaperDto, actor: AuthenticatedAdmin, meta?: RequestMeta): Promise<WallpaperAdminResponseDto> {
     const media = await this.media.assertUsable(dto.mediaId);
     if (dto.categoryIds?.length) await this.assertCategoriesExist(dto.categoryIds);
-    const slug = dto.slug ?? (await this.uniqueSlug(dto.title));
+    const write = this.textsForWrite(dto.translations, dto.title, dto.description ?? null, null);
+    if (!write?.parent.primary) throw new BadRequestException('Wallpaper title is required');
+    this.assertUniqueLocales(dto.translations?.map((row) => row.locale) ?? []);
+    const slug = dto.slug ?? (await this.uniqueSlug(write.parent.primary));
     if (dto.slug) await this.assertSlugFree(dto.slug);
     const isPublished = dto.isPublished ?? false;
 
     const wallpaper = await this.prisma.$transaction(async (tx) => {
       const created = await tx.wallpaper.create({
         data: {
-          title: dto.title,
-          description: dto.description ?? null,
+          title: write.parent.primary,
+          description: write.parent.secondary,
           slug,
           originalMediaId: media.id,
           width: media.width,
@@ -79,20 +86,21 @@ export class WallpapersService {
             ? { createMany: { data: dto.categoryIds.map((categoryId) => ({ categoryId })) } }
             : undefined,
         },
-        include: WALLPAPER_ADMIN_INCLUDE,
       });
+      await syncWallpaperTranslations(tx, created.id, write.rows, write.replace);
+      const full = await tx.wallpaper.findUniqueOrThrow({ where: { id: created.id }, include: WALLPAPER_ADMIN_INCLUDE });
       await this.audit.record(
         {
           adminId: actor.id,
           action: AuditAction.WallpaperCreated,
           entityType: AuditEntity.Wallpaper,
-          entityId: created.id,
-          metadata: { title: created.title, isPublished, categoryIds: dto.categoryIds ?? [] },
+          entityId: full.id,
+          metadata: { title: full.title, isPublished, categoryIds: dto.categoryIds ?? [], locales: write.rows.map((row) => row.locale) },
           meta,
         },
         tx,
       );
-      return created;
+      return full;
     });
     return this.toResponse(wallpaper);
   }
@@ -196,21 +204,28 @@ export class WallpapersService {
     const media = dto.mediaId ? await this.media.assertUsable(dto.mediaId) : null;
     if (dto.categoryIds?.length) await this.assertCategoriesExist(dto.categoryIds);
     if (dto.slug && dto.slug !== existing.slug) await this.assertSlugFree(dto.slug, id);
+    this.assertUniqueLocales(dto.translations?.map((row) => row.locale) ?? []);
+    const write = this.textsForWrite(dto.translations, dto.title, dto.description, {
+      primary: existing.title,
+      secondary: existing.description,
+    });
+    if (write && !write.parent.primary) throw new BadRequestException('Wallpaper title is required');
 
     const publishChange = dto.isPublished !== undefined && dto.isPublished !== existing.isPublished;
     const updated = await this.prisma.$transaction(async (tx) => {
       if (dto.categoryIds) {
+        await lockWallpaperRows(tx, [id]);
         await tx.wallpaperCategory.deleteMany({ where: { wallpaperId: id, categoryId: { notIn: dto.categoryIds } } });
         await tx.wallpaperCategory.createMany({
           data: dto.categoryIds.map((categoryId) => ({ wallpaperId: id, categoryId })),
           skipDuplicates: true,
         });
       }
+      if (write) await syncWallpaperTranslations(tx, id, write.rows, write.replace);
       const wallpaper = await tx.wallpaper.update({
         where: { id },
         data: {
-          ...(dto.title !== undefined ? { title: dto.title } : {}),
-          ...(dto.description !== undefined ? { description: dto.description } : {}),
+          ...(write ? { title: write.parent.primary, description: write.parent.secondary } : {}),
           ...(dto.slug !== undefined ? { slug: dto.slug } : {}),
           ...(dto.tags !== undefined ? { tags: dto.tags } : {}),
           ...(dto.isFeatured !== undefined ? { isFeatured: dto.isFeatured } : {}),
@@ -342,12 +357,14 @@ export class WallpapersService {
         await tx.wallpaper.updateMany({ where, data: { isFeatured: false } });
         return;
       case BulkWallpaperAction.AddCategories:
+        await lockWallpaperRows(tx, ids);
         await tx.wallpaperCategory.createMany({
           data: ids.flatMap((wallpaperId) => dto.categoryIds!.map((categoryId) => ({ wallpaperId, categoryId }))),
           skipDuplicates: true,
         });
         return;
       case BulkWallpaperAction.RemoveCategories:
+        await lockWallpaperRows(tx, ids);
         await tx.wallpaperCategory.deleteMany({ where: { wallpaperId: { in: ids }, categoryId: { in: dto.categoryIds! } } });
         return;
       case BulkWallpaperAction.Delete:
@@ -390,6 +407,7 @@ export class WallpapersService {
       id: w.id,
       title: w.title,
       description: w.description,
+      translations: w.translations.map((row) => ({ locale: row.locale, title: row.title, description: row.description })),
       slug: w.slug,
       tags: w.tags,
       orientation: w.orientation,
@@ -423,6 +441,24 @@ export class WallpapersService {
       });
     }
     return { succeeded, failed: results.length - succeeded, results };
+  }
+
+  private textsForWrite(
+    translations: CreateWallpaperDto['translations'],
+    legacyPrimary: string | undefined,
+    legacySecondary: string | null | undefined,
+    previous: { primary: string; secondary: string | null } | null,
+  ) {
+    const drafts: TranslationDraft[] | undefined = translations?.map((row) => ({
+      locale: row.locale,
+      primary: row.title,
+      secondary: row.description ?? null,
+    }));
+    return resolveWriteTexts({ translations: drafts, legacyPrimary, legacySecondary, previous });
+  }
+
+  private assertUniqueLocales(locales: string[]): void {
+    if (new Set(locales).size !== locales.length) throw new BadRequestException('Duplicate translation locales');
   }
 
   private async assertCategoriesExist(categoryIds: string[]): Promise<void> {

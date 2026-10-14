@@ -1,14 +1,16 @@
-import { Controller, Get, Param, ParseUUIDPipe, Query, UseInterceptors } from '@nestjs/common';
+import { Controller, Get, Headers, Param, ParseUUIDPipe, Query, UseInterceptors } from '@nestjs/common';
 import { ApiBadRequestResponse, ApiOkResponse, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Public } from '../../common/decorators/public.decorator';
-import { PaginationQueryDto } from '../../common/dto/pagination.dto';
 import { PublicCacheInterceptor } from '../../common/interceptors/public-cache.interceptor';
+import { resolveContentLocale } from '../../common/i18n/content-locale';
 import { ParseSlugPipe } from '../../common/pipes/parse-slug.pipe';
 import { ApiNotFound, ApiTooManyRequests, ApiValidationError } from '../../common/swagger/api-responses';
 import {
   AppConfigQueryDto,
   PublicCategoryDto,
   PublicFeedQueryDto,
+  PublicListQueryDto,
+  PublicLocaleQueryDto,
   PublicSearchQueryDto,
   PublicWallpaperDetailDto,
   PublicWallpapersQueryDto,
@@ -66,8 +68,8 @@ export class PublicController {
       },
     },
   })
-  getHome() {
-    return this.home.getHome();
+  getHome(@Query() query: PublicLocaleQueryDto, @Headers('accept-language') acceptLanguage?: string) {
+    return this.home.getHome(resolveContentLocale(query.lang, acceptLanguage));
   }
 
   @Get('app-config')
@@ -96,16 +98,16 @@ export class PublicController {
     },
   })
   @ApiValidationError()
-  getAppConfig(@Query() query: AppConfigQueryDto) {
-    return this.home.getAppConfig(query.platform, query.appVersion);
+  getAppConfig(@Query() query: AppConfigQueryDto, @Headers('accept-language') acceptLanguage?: string) {
+    return this.home.getAppConfig(query.platform, query.appVersion, resolveContentLocale(query.lang, acceptLanguage));
   }
 
   @Get('categories')
-  @ApiOperation({ summary: 'Published categories (manual order)' })
+  @ApiOperation({ summary: 'Published categories (manual order)', description: 'Names and descriptions follow lang, then Accept-Language, then English, then the originally stored text.' })
   @ApiOkResponse({ schema: { example: { data: [categoryExample], meta: { page: 1, limit: 20, total: 1, totalPages: 1 } } } })
   @ApiValidationError()
-  listCategories(@Query() query: PaginationQueryDto) {
-    return this.catalog.listCategories(query);
+  listCategories(@Query() query: PublicListQueryDto, @Headers('accept-language') acceptLanguage?: string) {
+    return this.catalog.listCategories(query, resolveContentLocale(query.lang, acceptLanguage));
   }
 
   @Get('categories/:slug')
@@ -113,49 +115,65 @@ export class PublicController {
   @ApiOkResponse({ type: PublicCategoryDto, schema: { example: { data: categoryExample } } })
   @ApiBadRequestResponse({ description: 'Malformed slug' })
   @ApiNotFound('Category')
-  getCategory(@Param('slug', ParseSlugPipe) slug: string) {
-    return this.catalog.getCategoryBySlug(slug);
+  getCategory(@Param('slug', ParseSlugPipe) slug: string, @Query() query: PublicLocaleQueryDto, @Headers('accept-language') acceptLanguage?: string) {
+    return this.catalog.getCategoryBySlug(slug, resolveContentLocale(query.lang, acceptLanguage));
   }
 
   @Get('wallpapers')
   @ApiOperation({
     summary: 'Published wallpapers',
-    description: 'Filter by categoryId / categorySlug / orientation / q; sort by latest, popular, downloads, featured or manual. Example: /public/wallpapers?page=1&limit=20&categoryId=...',
+    description: 'Filter by categoryId / categorySlug / orientation / q. sort=latest|popular|downloads|featured|manual|random. Random order is md5(id:seed) and stays stable for a seed. Example: /public/wallpapers?sort=random&seed=a1b2c3d4e5f67890&lang=ar',
   })
   @ApiOkResponse({ schema: { example: listExample } })
   @ApiValidationError()
   @ApiNotFound('Category')
-  listWallpapers(@Query() query: PublicWallpapersQueryDto) {
-    return this.catalog.listWallpapers(query);
+  listWallpapers(@Query() query: PublicWallpapersQueryDto, @Headers('accept-language') acceptLanguage?: string) {
+    return this.catalog.listWallpapers(query, resolveContentLocale(query.lang, acceptLanguage));
   }
 
   @Get('wallpapers/search')
   @ApiOperation({ summary: 'Keyword search over published wallpapers (title and tags)', description: '`q` is required (2-100 chars). Accepts the same filters as /public/wallpapers.' })
   @ApiOkResponse({ schema: { example: listExample } })
   @ApiValidationError()
-  search(@Query() query: PublicSearchQueryDto) {
-    return this.catalog.listWallpapers(query);
+  search(@Query() query: PublicSearchQueryDto, @Headers('accept-language') acceptLanguage?: string) {
+    return this.catalog.listWallpapers(query, resolveContentLocale(query.lang, acceptLanguage));
   }
 
   @Get('wallpapers/featured')
   @ApiOperation({ summary: 'Featured wallpapers (manual order)' })
   @ApiOkResponse({ schema: { example: listExample } })
-  featured(@Query() query: PublicFeedQueryDto) {
-    return this.catalog.featured(query);
+  featured(@Query() query: PublicFeedQueryDto, @Headers('accept-language') acceptLanguage?: string) {
+    return this.catalog.featured(query, resolveContentLocale(query.lang, acceptLanguage));
   }
 
   @Get('wallpapers/latest')
   @ApiOperation({ summary: 'Newest wallpapers (by publish date)' })
   @ApiOkResponse({ schema: { example: listExample } })
-  latest(@Query() query: PublicFeedQueryDto) {
-    return this.catalog.latest(query);
+  latest(@Query() query: PublicFeedQueryDto, @Headers('accept-language') acceptLanguage?: string) {
+    return this.catalog.latest(query, resolveContentLocale(query.lang, acceptLanguage));
   }
 
   @Get('wallpapers/popular')
   @ApiOperation({ summary: 'Most popular wallpapers (confirmed downloads, then views)' })
   @ApiOkResponse({ schema: { example: listExample } })
-  popular(@Query() query: PublicFeedQueryDto) {
-    return this.catalog.popular(query);
+  popular(@Query() query: PublicFeedQueryDto, @Headers('accept-language') acceptLanguage?: string) {
+    return this.catalog.popular(query, resolveContentLocale(query.lang, acceptLanguage));
+  }
+
+  @Get('wallpapers/:id/related')
+  @ApiOperation({
+    summary: 'Related published wallpapers',
+    description:
+      'Metadata similarity: same categories, then shared tags, then the same orientation. Other published wallpapers fill the rest. The source wallpaper is excluded. Registered before /wallpapers/:id so the fixed path is unambiguous.',
+  })
+  @ApiOkResponse({ schema: { example: listExample } })
+  @ApiNotFound('Wallpaper')
+  related(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Query() query: PublicListQueryDto,
+    @Headers('accept-language') acceptLanguage?: string,
+  ) {
+    return this.catalog.related(id, query, resolveContentLocale(query.lang, acceptLanguage));
   }
 
   @Get('wallpapers/:id')
@@ -177,7 +195,7 @@ export class PublicController {
   })
   @ApiBadRequestResponse({ description: 'Invalid id' })
   @ApiNotFound('Wallpaper')
-  getWallpaper(@Param('id', ParseUUIDPipe) id: string) {
-    return this.catalog.getWallpaper(id);
+  getWallpaper(@Param('id', ParseUUIDPipe) id: string, @Query() query: PublicLocaleQueryDto, @Headers('accept-language') acceptLanguage?: string) {
+    return this.catalog.getWallpaper(id, resolveContentLocale(query.lang, acceptLanguage));
   }
 }

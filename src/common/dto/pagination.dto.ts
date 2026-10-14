@@ -34,6 +34,9 @@ export class PaginationMetaDto {
 
   @ApiProperty({ example: 5 })
   totalPages: number;
+
+  @ApiPropertyOptional({ description: 'Present for sort=random. Reuse it for later pages in the same session.' })
+  seed?: string;
 }
 
 /**
@@ -46,12 +49,13 @@ export class Paginated<T> {
     public readonly meta: PaginationMetaDto,
   ) {}
 
-  static of<T>(data: T[], total: number, page: number, limit: number): Paginated<T> {
+  static of<T>(data: T[], total: number, page: number, limit: number, extra?: { seed?: string }): Paginated<T> {
     return new Paginated(data, {
       page,
       limit,
       total,
       totalPages: total === 0 ? 0 : Math.ceil(total / limit),
+      ...(extra?.seed ? { seed: extra.seed } : {}),
     });
   }
 }

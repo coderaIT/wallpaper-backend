@@ -19,8 +19,10 @@ import { ApiAdminAuth, ApiConflict, ApiNotFound, ApiValidationError } from '../.
 import { AuthenticatedAdmin } from '../auth/interfaces/authenticated-admin.interface';
 import { CategoriesService } from './categories.service';
 import {
+  CategoryDeletionImpactDto,
   CategoryResponseDto,
   CreateCategoryDto,
+  DeleteCategoryQueryDto,
   ListCategoriesQueryDto,
   SetCategoryCoverDto,
   UpdateCategoryDto,
@@ -78,6 +80,18 @@ export class CategoriesController {
     return this.categories.reorder(dto, admin, meta);
   }
 
+  @Get(':id/deletion-impact')
+  @ApiOperation({
+    summary: 'Preview category deletion',
+    description:
+      'Counts wallpapers linked to the category, how many belong only to it, how many are shared with other categories, and how many media files could be cleaned up.',
+  })
+  @ApiOkResponse({ type: CategoryDeletionImpactDto })
+  @ApiNotFound('Category')
+  deletionImpact(@Param('id', ParseUUIDPipe) id: string) {
+    return this.categories.deletionImpact(id);
+  }
+
   @Get(':id')
   @ApiOperation({ summary: 'Get a category' })
   @ApiOkResponse({ type: CategoryResponseDto, schema: { example: { data: categoryExample } } })
@@ -120,10 +134,19 @@ export class CategoriesController {
 
   @Delete(':id')
   @HttpCode(HttpStatus.NO_CONTENT)
-  @ApiOperation({ summary: 'Delete a category', description: 'Only the category and its wallpaper links are removed; wallpapers are kept.' })
+  @ApiOperation({
+    summary: 'Delete a category',
+    description:
+      'Removes the category and its links. Pass deleteExclusiveWallpapers=true to also delete wallpapers that belong only to this category. Wallpapers shared with other categories are preserved, and media still referenced elsewhere is kept.',
+  })
   @ApiNoContentResponse()
   @ApiNotFound('Category')
-  async remove(@Param('id', ParseUUIDPipe) id: string, @CurrentAdmin() admin: AuthenticatedAdmin, @ReqMeta() meta: RequestMeta): Promise<void> {
-    await this.categories.remove(id, admin, meta);
+  async remove(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Query() query: DeleteCategoryQueryDto,
+    @CurrentAdmin() admin: AuthenticatedAdmin,
+    @ReqMeta() meta: RequestMeta,
+  ): Promise<void> {
+    await this.categories.remove(id, query.deleteExclusiveWallpapers, admin, meta);
   }
 }

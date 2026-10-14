@@ -19,6 +19,7 @@ import {
   ValidateNested,
 } from 'class-validator';
 import { IsBooleanRecord, IsSafeExternalUrl } from '../../../common/validators/safe-url.validator';
+import { CONTENT_LOCALES, ContentLocale } from '../../../common/i18n/content-locale';
 
 export const SEMVER_PATTERN = /^\d{1,4}\.\d{1,4}\.\d{1,4}$/;
 
@@ -89,6 +90,22 @@ export class AppUpdateSettingsDto {
 
 export const ANNOUNCEMENT_LEVELS = ['INFO', 'WARNING', 'PROMO'] as const;
 
+export class AnnouncementTranslationDto {
+  @ApiProperty({ enum: CONTENT_LOCALES })
+  @IsIn(CONTENT_LOCALES)
+  locale!: ContentLocale;
+
+  @ApiProperty({ maxLength: 120 })
+  @IsString()
+  @MaxLength(120)
+  title!: string;
+
+  @ApiProperty({ maxLength: 1000 })
+  @IsString()
+  @MaxLength(1000)
+  message!: string;
+}
+
 export class AnnouncementDto {
   @ApiProperty({ example: 'summer-2026', description: 'Stable id so the app can remember dismissals' })
   @Matches(/^[a-z0-9][a-z0-9-]{0,63}$/, { message: 'id must be a lower-case slug (max 64 chars)' })
@@ -130,6 +147,14 @@ export class AnnouncementDto {
   @ValidateIf((_, v) => v !== null)
   @IsISO8601({ strict: true })
   endsAt: string | null;
+
+  @ApiPropertyOptional({ type: [AnnouncementTranslationDto], description: 'Optional Arabic, Turkish, and English copy. title/message remain the fallback.' })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(3)
+  @ValidateNested({ each: true })
+  @Type(() => AnnouncementTranslationDto)
+  translations?: AnnouncementTranslationDto[];
 }
 
 export class HomeSettingsDto {

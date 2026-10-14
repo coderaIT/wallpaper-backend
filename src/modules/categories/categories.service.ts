@@ -3,6 +3,8 @@ import { Prisma } from '../../generated/prisma/client';
 import { RequestMeta } from '../../common/decorators/request-meta.decorator';
 import { Paginated, toSkipTake } from '../../common/dto/pagination.dto';
 import { assertUniqueIds, ReorderDto } from '../../common/dto/reorder.dto';
+import { resolveWriteTexts, TranslationDraft } from '../../common/i18n/content-locale';
+import { syncCategoryTranslations } from '../../common/i18n/persist-translations';
 import { generateUniqueSlug } from '../../common/utils/slug.util';
 import { PrismaService } from '../../prisma/prisma.service';
 import { AuditAction, AuditEntity } from '../audit-logs/audit-actions';
@@ -10,7 +12,9 @@ import { AuditLogsService } from '../audit-logs/audit-logs.service';
 import { AuthenticatedAdmin } from '../auth/interfaces/authenticated-admin.interface';
 import { MEDIA_URL_SELECT, MediaUrlService } from '../media/media-url.service';
 import { MediaService } from '../media/media.service';
+import { idsStillExclusive, planCategoryDeletion } from './category-deletion';
 import {
+  CategoryDeletionImpactDto,
   CategoryResponseDto,
   CategorySortField,
   CreateCategoryDto,
@@ -20,6 +24,7 @@ import {
 
 export const CATEGORY_ADMIN_INCLUDE = {
   coverMedia: { select: MEDIA_URL_SELECT },
+  translations: { select: { locale: true, name: true, description: true }, orderBy: { locale: 'asc' as const } },
   _count: {
     select: {
       wallpapers: true,
@@ -40,34 +45,38 @@ export class CategoriesService {
 
   async create(dto: CreateCategoryDto, actor: AuthenticatedAdmin, meta: RequestMeta): Promise<CategoryResponseDto> {
     if (dto.coverMediaId) await this.media.assertUsable(dto.coverMediaId);
-    const slug = dto.slug ?? (await this.uniqueSlug(dto.name));
+    const write = this.textsForWrite(dto.translations, dto.name, dto.description ?? null, null);
+    if (!write?.parent.primary) throw new BadRequestException('Category name is required');
+    this.assertUniqueLocales(dto.translations?.map((row) => row.locale) ?? []);
+    const slug = dto.slug ?? (await this.uniqueSlug(write.parent.primary));
     await this.assertSlugFree(slug);
     const sortOrder = dto.sortOrder ?? (await this.nextSortOrder());
 
     const category = await this.prisma.$transaction(async (tx) => {
       const created = await tx.category.create({
         data: {
-          name: dto.name,
+          name: write.parent.primary,
           slug,
-          description: dto.description ?? null,
+          description: write.parent.secondary,
           coverMediaId: dto.coverMediaId ?? null,
           isPublished: dto.isPublished ?? false,
           sortOrder,
         },
-        include: CATEGORY_ADMIN_INCLUDE,
       });
+      await syncCategoryTranslations(tx, created.id, write.rows, write.replace);
+      const full = await tx.category.findUniqueOrThrow({ where: { id: created.id }, include: CATEGORY_ADMIN_INCLUDE });
       await this.audit.record(
         {
           adminId: actor.id,
           action: AuditAction.CategoryCreated,
           entityType: AuditEntity.Category,
-          entityId: created.id,
-          metadata: { name: created.name, slug: created.slug, isPublished: created.isPublished },
+          entityId: full.id,
+          metadata: { name: full.name, slug: full.slug, isPublished: full.isPublished, locales: write.rows.map((row) => row.locale) },
           meta,
         },
         tx,
       );
-      return created;
+      return full;
     });
     return this.toResponse(category, 0);
   }
@@ -80,6 +89,17 @@ export class CategoriesService {
             OR: [
               { name: { contains: query.search, mode: 'insensitive' } },
               { slug: { contains: query.search.toLowerCase() } },
+              { description: { contains: query.search, mode: 'insensitive' } },
+              {
+                translations: {
+                  some: {
+                    OR: [
+                      { name: { contains: query.search, mode: 'insensitive' } },
+                      { description: { contains: query.search, mode: 'insensitive' } },
+                    ],
+                  },
+                },
+              },
             ],
           }
         : {}),
@@ -113,14 +133,20 @@ export class CategoriesService {
     const existing = await this.prisma.category.findUnique({ where: { id } });
     if (!existing) throw new NotFoundException('Category not found');
     if (dto.slug && dto.slug !== existing.slug) await this.assertSlugFree(dto.slug, id);
+    this.assertUniqueLocales(dto.translations?.map((row) => row.locale) ?? []);
+    const write = this.textsForWrite(dto.translations, dto.name, dto.description, {
+      primary: existing.name,
+      secondary: existing.description,
+    });
+    if (write && !write.parent.primary) throw new BadRequestException('Category name is required');
 
     const updated = await this.prisma.$transaction(async (tx) => {
+      if (write) await syncCategoryTranslations(tx, id, write.rows, write.replace);
       const category = await tx.category.update({
         where: { id },
         data: {
-          ...(dto.name !== undefined ? { name: dto.name } : {}),
+          ...(write ? { name: write.parent.primary, description: write.parent.secondary } : {}),
           ...(dto.slug !== undefined ? { slug: dto.slug } : {}),
-          ...(dto.description !== undefined ? { description: dto.description } : {}),
           ...(dto.isPublished !== undefined ? { isPublished: dto.isPublished } : {}),
           ...(dto.sortOrder !== undefined ? { sortOrder: dto.sortOrder } : {}),
         },
@@ -193,14 +219,64 @@ export class CategoriesService {
     return { updated: dto.items.length };
   }
 
-  /** Deletes the category and its wallpaper links only; wallpapers themselves are untouched. */
-  async remove(id: string, actor: AuthenticatedAdmin, meta: RequestMeta): Promise<void> {
-    await this.prisma.$transaction(async (tx) => {
-      const category = await tx.category.findUnique({
-        where: { id },
-        include: { _count: { select: { wallpapers: true } } },
-      });
+  async deletionImpact(id: string): Promise<CategoryDeletionImpactDto> {
+    const category = await this.prisma.category.findUnique({ where: { id }, select: { id: true } });
+    if (!category) throw new NotFoundException('Category not found');
+    const plan = await this.deletionPlan(this.prisma, id);
+    return {
+      categoryId: id,
+      associatedWallpapers: plan.associatedWallpapers,
+      exclusiveWallpapers: plan.exclusiveWallpapers,
+      sharedWallpapers: plan.sharedWallpapers,
+      mediaEligibleForCleanup: plan.mediaEligibleForCleanup,
+    };
+  }
+
+  /**
+   * Deletes the category. Exclusive wallpapers are removed only when that option is explicit.
+   * Shared wallpapers lose this link and stay. Media cleanup runs after commit and refuses files still in use.
+   */
+  async remove(id: string, deleteExclusiveWallpapers: boolean, actor: AuthenticatedAdmin, meta: RequestMeta): Promise<void> {
+    const deletedMediaIds = await this.prisma.$transaction(async (tx) => {
+      const locked = await tx.$queryRaw<{ id: string; name: string; slug: string }[]>`
+        SELECT id::text AS id, name, slug FROM categories WHERE id = ${id}::uuid FOR UPDATE
+      `;
+      const category = locked[0];
       if (!category) throw new NotFoundException('Category not found');
+
+      const links = await tx.$queryRaw<{ wallpaper_id: string }[]>`
+        SELECT wallpaper_id::text AS wallpaper_id
+        FROM wallpaper_categories
+        WHERE category_id = ${id}::uuid
+        ORDER BY wallpaper_id
+      `;
+      const wallpaperIds = links.map((row) => row.wallpaper_id);
+      if (wallpaperIds.length > 0) {
+        await tx.$queryRaw`SELECT id FROM wallpapers WHERE id = ANY(${wallpaperIds}::uuid[]) ORDER BY id FOR UPDATE`;
+      }
+      const counted = wallpaperIds.length
+        ? await tx.$queryRaw<{ id: string; media_id: string; category_count: number }[]>`
+            SELECT w.id::text AS id,
+                   w.original_media_id::text AS media_id,
+                   (SELECT COUNT(*)::int FROM wallpaper_categories wc WHERE wc.wallpaper_id = w.id) AS category_count
+            FROM wallpapers w
+            WHERE w.id = ANY(${wallpaperIds}::uuid[])
+          `
+        : [];
+      const facts = counted.map((row) => ({
+        wallpaperId: row.id,
+        mediaId: row.media_id,
+        categoryCount: Number(row.category_count),
+      }));
+      const plan = planCategoryDeletion(facts, await this.mediaFacts(tx, id, facts));
+      const exclusiveIds = deleteExclusiveWallpapers
+        ? idsStillExclusive(
+            facts
+              .filter((row) => plan.exclusiveWallpaperIds.includes(row.wallpaperId))
+              .map((row) => ({ id: row.wallpaperId, categoryCount: row.categoryCount })),
+          )
+        : [];
+      if (exclusiveIds.length > 0) await tx.wallpaper.deleteMany({ where: { id: { in: exclusiveIds } } });
       await tx.category.delete({ where: { id } });
       await this.audit.record(
         {
@@ -208,12 +284,30 @@ export class CategoriesService {
           action: AuditAction.CategoryDeleted,
           entityType: AuditEntity.Category,
           entityId: id,
-          metadata: { name: category.name, slug: category.slug, unlinkedWallpapers: category._count.wallpapers },
+          metadata: {
+            name: category.name,
+            slug: category.slug,
+            deleteExclusiveWallpapers,
+            associatedWallpapers: plan.associatedWallpapers,
+            exclusiveWallpapers: plan.exclusiveWallpapers,
+            sharedWallpapers: plan.sharedWallpapers,
+            deletedWallpaperIds: exclusiveIds,
+            preservedWallpaperIds: plan.sharedWallpaperIds,
+          },
           meta,
         },
         tx,
       );
+      return facts.filter((row) => exclusiveIds.includes(row.wallpaperId)).map((row) => row.mediaId);
     });
+
+    for (const mediaId of [...new Set(deletedMediaIds)]) {
+      try {
+        await this.media.remove(mediaId, actor, meta);
+      } catch (error) {
+        if (!(error instanceof ConflictException || error instanceof NotFoundException)) throw error;
+      }
+    }
   }
 
   async assertExists(id: string): Promise<void> {
@@ -227,6 +321,7 @@ export class CategoriesService {
       name: c.name,
       slug: c.slug,
       description: c.description,
+      translations: c.translations.map((row) => ({ locale: row.locale, name: row.name, description: row.description })),
       sortOrder: c.sortOrder,
       isPublished: c.isPublished,
       cover: c.coverMedia ? { mediaId: c.coverMedia.id, ...this.urls.urls(c.coverMedia) } : null,
@@ -259,6 +354,83 @@ export class CategoriesService {
       async (slug) => (await this.prisma.category.count({ where: { slug } })) > 0,
       120,
     );
+  }
+
+  private textsForWrite(
+    translations: CreateCategoryDto['translations'],
+    legacyPrimary: string | undefined,
+    legacySecondary: string | null | undefined,
+    previous: { primary: string; secondary: string | null } | null,
+  ) {
+    const drafts: TranslationDraft[] | undefined = translations?.map((row) => ({
+      locale: row.locale,
+      primary: row.name,
+      secondary: row.description ?? null,
+    }));
+    return resolveWriteTexts({ translations: drafts, legacyPrimary, legacySecondary, previous });
+  }
+
+  private assertUniqueLocales(locales: string[]): void {
+    if (new Set(locales).size !== locales.length) throw new BadRequestException('Duplicate translation locales');
+  }
+
+  private async deletionPlan(db: Prisma.TransactionClient | PrismaService, categoryId: string) {
+    const links = await db.wallpaperCategory.findMany({
+      where: { categoryId },
+      select: { wallpaperId: true, wallpaper: { select: { originalMediaId: true } } },
+    });
+    const ids = links.map((link) => link.wallpaperId);
+    const counts = ids.length
+      ? await db.wallpaperCategory.groupBy({
+          by: ['wallpaperId'],
+          where: { wallpaperId: { in: ids } },
+          _count: { _all: true },
+        })
+      : [];
+    const countById = new Map(counts.map((row) => [row.wallpaperId, row._count._all]));
+    const facts = links.map((link) => ({
+      wallpaperId: link.wallpaperId,
+      mediaId: link.wallpaper.originalMediaId,
+      categoryCount: countById.get(link.wallpaperId) ?? 1,
+    }));
+    return planCategoryDeletion(facts, await this.mediaFacts(db, categoryId, facts));
+  }
+
+  private async mediaFacts(
+    db: Prisma.TransactionClient | PrismaService,
+    categoryId: string,
+    facts: { wallpaperId: string; mediaId: string; categoryCount: number }[],
+  ) {
+    const exclusive = facts.filter((row) => row.categoryCount === 1);
+    const mediaIds = [...new Set(exclusive.map((row) => row.mediaId))];
+    const exclusiveIds = exclusive.map((row) => row.wallpaperId);
+    if (mediaIds.length === 0) return [];
+    const [wallpapers, covers, banners] = await Promise.all([
+      db.wallpaper.groupBy({
+        by: ['originalMediaId'],
+        where: { originalMediaId: { in: mediaIds }, ...(exclusiveIds.length ? { id: { notIn: exclusiveIds } } : {}) },
+        _count: { _all: true },
+      }),
+      db.category.groupBy({
+        by: ['coverMediaId'],
+        where: { coverMediaId: { in: mediaIds }, NOT: { id: categoryId } },
+        _count: { _all: true },
+      }),
+      db.banner.groupBy({
+        by: ['imageMediaId'],
+        where: { imageMediaId: { in: mediaIds } },
+        _count: { _all: true },
+      }),
+    ]);
+    const wallpaperCounts = new Map(wallpapers.map((row) => [row.originalMediaId, row._count._all]));
+    const coverCounts = new Map(covers.flatMap((row) => (row.coverMediaId ? [[row.coverMediaId, row._count._all] as const] : [])));
+    const bannerCounts = new Map(banners.map((row) => [row.imageMediaId, row._count._all]));
+    return mediaIds.map((mediaId) => ({
+      mediaId,
+      otherWallpapers: wallpaperCounts.get(mediaId) ?? 0,
+      otherCategoryCovers: coverCounts.get(mediaId) ?? 0,
+      banners: bannerCounts.get(mediaId) ?? 0,
+    }));
   }
 
   private async nextSortOrder(): Promise<number> {
